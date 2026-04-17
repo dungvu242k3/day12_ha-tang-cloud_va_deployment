@@ -48,53 +48,24 @@ _is_ready = False
 _request_count = 0
 _error_count = 0
 
-# ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
-# ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
-
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
+# Auth, Rate Limiter, Cost Guard
+from app.auth import verify_api_key
+from app.rate_limiter import check_rate_limit
+from app.cost_guard import check_and_record_cost, get_current_usage
 
 # ─────────────────────────────────────────────────────────
-# Simple Cost Guard
+# Logging — JSON structured
 # ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
+logging.basicConfig(
+    level=logging.DEBUG if settings.debug else logging.INFO,
+    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
+)
+logger = logging.getLogger(__name__)
 
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
-
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
+START_TIME = time.time()
+_is_ready = False
+_request_count = 0
+_error_count = 0
 
 # ─────────────────────────────────────────────────────────
 # Lifespan
@@ -145,7 +116,8 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        if "server" in response.headers:
+            del response.headers["server"]
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
             "event": "request",
@@ -157,20 +129,36 @@ async def request_middleware(request: Request, call_next):
         return response
     except Exception as e:
         _error_count += 1
+        logger.error(json.dumps({"event": "error", "msg": str(e)}))
         raise
 
 # ─────────────────────────────────────────────────────────
 # Models
 # ─────────────────────────────────────────────────────────
 class AskRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=50,
+                        description="Unique ID for the user/conversation session")
     question: str = Field(..., min_length=1, max_length=2000,
                           description="Your question for the agent")
 
 class AskResponse(BaseModel):
+    user_id: str
     question: str
     answer: str
     model: str
     timestamp: str
+    usage: dict
+
+# ─────────────────────────────────────────────────────────
+# Redis History Helper
+# ─────────────────────────────────────────────────────────
+from redis import Redis
+_redis_history = None
+try:
+    _redis_history = Redis.from_url(settings.redis_url, socket_timeout=settings.redis_timeout)
+    _redis_history.ping()
+except:
+    _redis_history = None
 
 # ─────────────────────────────────────────────────────────
 # Endpoints
@@ -180,13 +168,8 @@ class AskResponse(BaseModel):
 def root():
     return {
         "app": settings.app_name,
-        "version": settings.app_version,
-        "environment": settings.environment,
-        "endpoints": {
-            "ask": "POST /ask (requires X-API-Key)",
-            "health": "GET /health",
-            "ready": "GET /ready",
-        },
+        "status": "online",
+        "stateless": _redis_history is not None
     }
 
 
@@ -197,33 +180,55 @@ async def ask_agent(
     _key: str = Depends(verify_api_key),
 ):
     """
-    Send a question to the AI agent.
-
-    **Authentication:** Include header `X-API-Key: <your-key>`
+    Send a question to the AI agent with conversation context.
+    
+    **Context:** Agent will try to remember the last 5 messages for the given `user_id`.
     """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
-
-    # Budget check
+    # Rate limit & Budget check
+    check_rate_limit(_key[:8])
     input_tokens = len(body.question.split()) * 2
     check_and_record_cost(input_tokens, 0)
 
-    logger.info(json.dumps({
-        "event": "agent_call",
-        "q_len": len(body.question),
-        "client": str(request.client.host) if request.client else "unknown",
-    }))
+    # 1. Retrieve history from Redis
+    history_key = f"hist:{body.user_id}"
+    context = ""
+    if _redis_history:
+        try:
+            # Lấy 5 tin nhắn gần nhất
+            past_messages = _redis_history.lrange(history_key, 0, 4)
+            if past_messages:
+                context = "\n".join([m.decode('utf-8') for m in reversed(past_messages)])
+        except Exception as e:
+            logger.error(f"History retrieval error: {e}")
 
-    answer = llm_ask(body.question)
+    # 2. Call LLM with context
+    prompt = f"Context:\n{context}\n\nQuestion: {body.question}" if context else body.question
+    answer = llm_ask(prompt)
 
+    # 3. Save new message to history
+    if _redis_history:
+        try:
+            new_entry = f"User: {body.question} | Agent: {answer}"
+            _redis_history.lpush(history_key, new_entry)
+            _redis_history.ltrim(history_key, 0, 9)  # Keep last 10 entries
+            _redis_history.expire(history_key, 3600)  # Expire in 1h
+        except Exception as e:
+            logger.error(f"History save error: {e}")
+
+    # Record output tokens
     output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
+    usage_info = check_and_record_cost(0, output_tokens)
 
     return AskResponse(
+        user_id=body.user_id,
         question=body.question,
         answer=answer,
         model=settings.llm_model,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        usage={
+            "daily_cost_usd": round(usage_info, 4),
+            "budget_usd": settings.daily_budget_usd
+        }
     )
 
 
@@ -254,13 +259,14 @@ def ready():
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
     """Basic metrics (protected)."""
+    usage = get_current_usage()
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
-        "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
+        "daily_cost_usd": usage["daily_cost_usd"],
+        "daily_budget_usd": usage["daily_budget_usd"],
+        "budget_used_pct": round(usage["daily_cost_usd"] / usage["daily_budget_usd"] * 100, 1) if usage["daily_budget_usd"] > 0 else 0,
     }
 
 

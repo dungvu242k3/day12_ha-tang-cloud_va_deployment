@@ -34,11 +34,12 @@ security = HTTPBearer(auto_error=False)
 
 def create_token(username: str, role: str) -> str:
     """Tạo JWT token với expiry."""
+    now = int(time.time())
     payload = {
         "sub": username,           # subject (user identifier)
         "role": role,
-        "iat": datetime.now(timezone.utc),  # issued at
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        "iat": now,                # issued at (timestamp)
+        "exp": now + (ACCESS_TOKEN_EXPIRE_MINUTES * 60), # expiry (timestamp)
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 

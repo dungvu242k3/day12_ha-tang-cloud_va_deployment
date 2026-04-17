@@ -1,7 +1,11 @@
-"""Production config — 12-Factor: tất cả từ environment variables."""
 import os
 import logging
 from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+# Nạp biến môi trường từ file .env (tìm theo đường dẫn tuyệt đối của project)
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(base_dir, ".env"))
 
 
 @dataclass
@@ -37,8 +41,9 @@ class Settings:
         default_factory=lambda: float(os.getenv("DAILY_BUDGET_USD", "5.0"))
     )
 
-    # Storage
-    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", ""))
+    # Storage — Redis (Stateless Design)
+    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    redis_timeout: int = field(default_factory=lambda: int(os.getenv("REDIS_TIMEOUT", "5")))
 
     def validate(self):
         logger = logging.getLogger(__name__)

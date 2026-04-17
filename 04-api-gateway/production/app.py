@@ -72,17 +72,18 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    """Thêm security headers vào mọi response."""
-    response: Response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    # Ẩn server info
-    response.headers.pop("server", None)
-    return response
+# @app.middleware("http")
+# async def security_headers(request: Request, call_next):
+#     """Thêm security headers vào mọi response."""
+#     response: Response = await call_next(request)
+#     response.headers["X-Content-Type-Options"] = "nosniff"
+#     response.headers["X-Frame-Options"] = "DENY"
+#     response.headers["X-XSS-Protection"] = "1; mode=block"
+#     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+#     # Ẩn server info
+#     if "server" in response.headers:
+#         del response.headers["server"]
+#     return response
 
 
 # ──────────────────────────────────────────────────────────
@@ -108,7 +109,7 @@ def login(body: LoginRequest):
     Token hết hạn sau 60 phút.
     """
     user = authenticate_user(body.username, body.password)
-    token = create_token(user["username"], user["role"])
+    token = str(create_token(user["username"], user["role"]))
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -199,4 +200,4 @@ if __name__ == "__main__":
     print("  student / demo123  (10 req/min, $1/day budget)")
     print("  teacher / teach456 (100 req/min, $1/day budget)")
     print(f"\nDocs: http://localhost:{port}/docs\n")
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
